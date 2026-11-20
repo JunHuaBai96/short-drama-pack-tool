@@ -1,0 +1,8 @@
+.py312/
+build/
+dist/
+__pycache__/
+*.spec
+*.png
+*.tar.gz
+*.whl
