@@ -25,11 +25,12 @@ import threading
 import time
 import unicodedata
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.2.0"
+APP_VERSION = "1.2.1"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -88,8 +89,29 @@ def normalize_title(s: str) -> str:
     return s
 
 
-def fetch_pool(force: bool = False, progress_cb=None):
-    """实时拉取北斗任务页（inbeidou.cn/task 数据源）。force=True 跳过缓存。"""
+def _fetch_task_page(app_id, page, order_field, order_dir, timeout=15, retries=1):
+    """单次请求任务页数据源（inbeidou.cn/task 页面接口）。失败重试一次。"""
+    url = (f"{BEIDOU_API}?language=2&app_id={app_id}&page_num={page}"
+           f"&page_size=100&order_field={order_field}&order_dir={order_dir}")
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": f"{APP_NAME}/{APP_VERSION}"})
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            return ((body or {}).get("body") or {}).get("data") or []
+        except Exception:
+            if attempt >= retries:
+                return []
+            time.sleep(0.5)
+
+
+def fetch_pool(force: bool = False, progress_cb=None, workers: int = 12):
+    """实时拉取北斗任务页（inbeidou.cn/task 数据源）。
+
+    覆盖全部排序组合（publish_at/total_income × desc/asc）× 前两页 × 18 剧场，
+    否则会漏掉 60% 以上的剧目（导致按剧名匹配不到简介）。
+    force=True 强制实时检索，完全不读缓存；匹配简介流程必须用 force=True。
+    """
     if not force and os.path.exists(CACHE_FILE):
         age = time.time() - os.path.getmtime(CACHE_FILE)
         if age < CACHE_TTL:
@@ -99,23 +121,34 @@ def fetch_pool(force: bool = False, progress_cb=None):
             except Exception:
                 pass
     os.makedirs(CACHE_DIR, exist_ok=True)
+    jobs = [(a, p, f, d)
+            for a in THEATER_IDS
+            for f in ("publish_at", "total_income")
+            for d in ("desc", "asc")
+            for p in (1, 2)]
     pool = {}
-    total = len(THEATER_IDS)
-    for idx, app_id in enumerate(THEATER_IDS):
-        for page in (1, 2):
-            url = (f"{BEIDOU_API}?language=2&app_id={app_id}&page_num={page}"
-                   f"&page_size=100&order_field=publish_at&order_dir=desc")
-            try:
-                req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
-                with urllib.request.urlopen(req, timeout=15) as r:
-                    body = json.loads(r.read().decode("utf-8"))
-                data = ((body or {}).get("body") or {}).get("data") or []
-                for item in data:
-                    pool[str(item.get("task_id"))] = item
-            except Exception:
-                continue
-        if progress_cb:
-            progress_cb(idx + 1, total)
+    done = [0]
+    lock = threading.Lock()
+
+    def run(job):
+        items = _fetch_task_page(*job)
+        with lock:
+            for it in items:
+                tid = str(it.get("task_id"))
+                if not tid or tid == "None":
+                    continue
+                old = pool.get(tid)
+                # 同剧多来源/多排序会出现多条记录，保留简介最完整的那条
+                if old is None or len((it.get("description") or "").strip()) > \
+                        len((old.get("description") or "").strip()):
+                    pool[tid] = it
+            done[0] += 1
+            if progress_cb:
+                progress_cb(done[0], len(jobs))
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        list(ex.map(run, jobs))
+
     result = list(pool.values())
     result.sort(key=lambda x: x.get("publish_at") or "", reverse=True)
     try:
@@ -857,29 +890,36 @@ class App(tk.Tk):
             messagebox.showinfo(APP_NAME, "请先添加剧集（左侧剧名按行加入 / 手动添加 / 工作台导入）。")
             return
         self.progress_var.set("实时检索任务页…")
-        self.statusbar.config(text="正在实时检索 inbeidou.cn/task 任务页数据源（强制刷新，不走缓存）…")
+        self.statusbar.config(text="正在实时检索 inbeidou.cn/task 任务页数据源（全部排序组合，强制刷新，禁止缓存）…")
 
         def progress(idx, total):
-            self.after(0, lambda: self.progress_var.set(f"实时拉取 {idx}/{total}"))
+            self.after(0, lambda: self.progress_var.set(f"实时拉取任务页 {idx}/{total}"))
 
         def work():
             try:
                 pool = fetch_pool(force=True, progress_cb=progress)
-                self.pool = pool
-                self.after(0, lambda: self._do_match())
             except Exception as e:
                 self.after(0, lambda: self.statusbar.config(text=f"匹配失败：{e}"))
+                return
+            self.pool = pool
+            if not pool:
+                self.after(0, lambda: self.statusbar.config(
+                    text="实时检索失败（任务页数据源无返回）。请检查网络后重试。"))
+                self.after(0, lambda: self.progress_var.set("检索失败"))
+                return
+            self.after(0, lambda: self._do_match())
 
         threading.Thread(target=work, daemon=True).start()
 
     def _do_match(self):
-        hit, miss = 0, 0
+        hit, miss, skip = 0, 0, 0
         for tab in self.tabs:
             title = tab.current_title()
             if not title:
                 continue
             if tab.synopsis.get("1.0", "end").strip():
-                continue  # 已有简介不覆盖
+                skip += 1  # 已有简介不覆盖
+                continue
             rec, score = match_in_pool(title, self.pool)
             if rec:
                 desc = (rec.get("description") or "").strip()
@@ -893,7 +933,7 @@ class App(tk.Tk):
                     continue
             tab.status_var.set("✗ 未匹配到——" + INCOMPLETE_NOTE + "，请手动粘贴简介")
             miss += 1
-        self.progress_var.set(f"匹配完成：{hit} 成功 / {miss} 待补")
+        self.progress_var.set(f"匹配完成：{hit} 成功 / {skip} 已有简介 / {miss} 待补")
         self.statusbar.config(text="匹配完成。绿色=已就绪；黄色提示=请手动粘贴简介后重新生成。")
 
     # ---------- 生成 / 复制 ----------
