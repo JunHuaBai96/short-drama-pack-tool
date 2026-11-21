@@ -18,6 +18,7 @@ import base64
 import difflib
 import json
 import os
+import queue
 import re
 import sys
 import tempfile
@@ -25,16 +26,28 @@ import threading
 import time
 import unicodedata
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.2.1"
+APP_VERSION = "1.3.0"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
-CACHE_TTL = 6 * 3600  # 缓存兜底 6 小时（匹配简介时强制刷新）
+CACHE_TTL = 6 * 3600  # 缓存兜底 6 小时（匹配简介时强制刷新，不走缓存）
+LOG_FILE = os.path.join(CACHE_DIR, "match_log.txt")
+
+
+def log_match(line: str):
+    """匹配流程运行日志（可审计实时访问情况）。"""
+    try:
+        os.makedirs(CACHE_DIR, exist_ok=True)
+        from datetime import datetime
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            f.write(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {line}\n")
+    except Exception:
+        pass
 
 BEIDOU_API = "https://api-scenter.inbeidou.cn/agent/v1/task/page"  # inbeidou.cn/task 页面数据源
 THEATER_IDS = [
@@ -89,8 +102,8 @@ def normalize_title(s: str) -> str:
     return s
 
 
-def _fetch_task_page(app_id, page, order_field, order_dir, timeout=15, retries=1):
-    """单次请求任务页数据源（inbeidou.cn/task 页面接口）。失败重试一次。"""
+def _fetch_task_page(app_id, page, order_field, order_dir, timeout=15, retries=2):
+    """单次请求任务页数据源（inbeidou.cn/task 页面接口）。失败重试两次（短退避）。"""
     url = (f"{BEIDOU_API}?language=2&app_id={app_id}&page_num={page}"
            f"&page_size=100&order_field={order_field}&order_dir={order_dir}")
     for attempt in range(retries + 1):
@@ -102,22 +115,23 @@ def _fetch_task_page(app_id, page, order_field, order_dir, timeout=15, retries=1
         except Exception:
             if attempt >= retries:
                 return []
-            time.sleep(0.5)
+            time.sleep(0.8 * (attempt + 1))
 
 
-def fetch_pool(force: bool = False, progress_cb=None, workers: int = 12):
+def fetch_pool(force: bool = False, progress_cb=None, workers: int = 8, max_seconds: int = 180):
     """实时拉取北斗任务页（inbeidou.cn/task 数据源）。
 
     覆盖全部排序组合（publish_at/total_income × desc/asc）× 前两页 × 18 剧场，
     否则会漏掉 60% 以上的剧目（导致按剧名匹配不到简介）。
     force=True 强制实时检索，完全不读缓存；匹配简介流程必须用 force=True。
+    返回 (pool_list, failed_requests)。max_seconds 为总时长兜底，超时返回已收集的部分结果。
     """
     if not force and os.path.exists(CACHE_FILE):
         age = time.time() - os.path.getmtime(CACHE_FILE)
         if age < CACHE_TTL:
             try:
                 with open(CACHE_FILE, "r", encoding="utf-8") as f:
-                    return json.load(f)
+                    return json.load(f), 0
             except Exception:
                 pass
     os.makedirs(CACHE_DIR, exist_ok=True)
@@ -128,11 +142,14 @@ def fetch_pool(force: bool = False, progress_cb=None, workers: int = 12):
             for p in (1, 2)]
     pool = {}
     done = [0]
+    failed = [0]
     lock = threading.Lock()
 
     def run(job):
         items = _fetch_task_page(*job)
         with lock:
+            if not items:
+                failed[0] += 1
             for it in items:
                 tid = str(it.get("task_id"))
                 if not tid or tid == "None":
@@ -146,17 +163,32 @@ def fetch_pool(force: bool = False, progress_cb=None, workers: int = 12):
             if progress_cb:
                 progress_cb(done[0], len(jobs))
 
-    with ThreadPoolExecutor(max_workers=workers) as ex:
-        list(ex.map(run, jobs))
+    ex = ThreadPoolExecutor(max_workers=workers)
+    futs = {ex.submit(run, j): j for j in jobs}
+    timed_out = False
+    try:
+        for _ in as_completed(futs, timeout=max_seconds):
+            pass
+    except Exception:
+        # 总时长兜底：网络极端缓慢时收敛，返回已收集的部分结果
+        timed_out = True
+    finally:
+        ex.shutdown(wait=False, cancel_futures=True)
+    if timed_out:
+        with lock:
+            failed[0] = len(jobs) - done[0]
+        log_match(f"实时检索总时长超 {max_seconds}s，完成 {done[0]}/{len(jobs)}，按部分结果继续")
 
     result = list(pool.values())
     result.sort(key=lambda x: x.get("publish_at") or "", reverse=True)
+    log_match(f"实时检索任务页数据源: 请求 {len(jobs)} 个, 失败 {failed[0]} 个, "
+              f"获得 {len(result)} 条")
     try:
         with open(CACHE_FILE, "w", encoding="utf-8") as f:
             json.dump(result, f, ensure_ascii=False)
     except Exception:
         pass
-    return result
+    return result, failed[0]
 
 
 def match_in_pool(title: str, pool):
@@ -371,6 +403,99 @@ GENRE_RULES = [
 
 STOPWORDS_TITLE = {"the","they","their","that","this","with","from","couldn","would","should","didn","doesn","wasn","weren","have","has","had","never","about","into","when","where","what"}
 
+STOPWORDS_ALL = {
+    "the","a","an","and","but","or","so","if","then","than","that","this","these","those",
+    "he","she","it","they","them","his","her","their","him","its","we","our","you","your",
+    "was","were","is","are","be","been","being","am","do","does","did","doing","done",
+    "have","has","had","having","will","would","can","could","should","shall","may","might","must",
+    "not","no","nor","yes","very","just","only","even","also","still","yet","ever","never",
+    "about","into","onto","upon","over","under","after","before","while","when","where","what","who","whom","whose","which",
+    "with","without","from","for","of","off","out","in","on","at","by","to","up","down","again",
+    "there","here","one","two","three","five","ten","first","next","last","other","another","same","all","any","both","each","few","more","most","some","such",
+    "because","until","although","though","however","instead","finally","later","once","soon","now",
+    "when","every","own","mr","mrs","ms","dr","couldn","wouldn","shouldn","didn","doesn","wasn","weren","hasn","haven","won","ain",
+}
+
+CONFLICT_WORDS = ["steal","stole","stolen","taken","took","rejected","reject","betray","betrayed","lied","lie","lying","force","forced","framed","frame","fired","broke","broken","ruin","ruined","destroy","destroyed","cheat","cheated","bullied","bully","humiliated","humiliate","mocked","replace","replaced","abandon","abandoned","kicked","dumped","divorce","punish","punished","hurt"]
+REVEAL_WORDS = ["truth","revealed","reveal","secret","identity","discovered","discovery","exposed","expose","actually","real","disguise","hidden","found out","true","uncovered","unveiled"]
+LOVE_WORDS = ["love","loved","romance","romantic","married","marriage","wedding","bride","groom","heart","soulmate","fate","destiny","kiss"]
+RICH_WORDS = ["billionaire","ceo","chairman","company","empire","fortune","wealth","wealthy","capital","business","heir","heiress","tycoon","executive","conglomerate"]
+POWER_WORDS = ["queen","king","alpha","luna","pack","boss","president","don","mafia","gang","underworld","warrior","general"]
+
+
+def _is_name_word(w: str) -> bool:
+    return (len(w) >= 3 and w[0].isupper() and w[1:].islower()
+            and w.lower() not in STOPWORDS_ALL and w not in {"The","A","An","He","She","It","But","And","When","After","Before","Then","Their","There","This","That","They","His","Her","However","One","Five","Years","Later","Miss","Mister","Mr","Mrs"})
+
+
+def _tag_camel(s: str) -> str:
+    s = s.replace("'", "")
+    return "".join(w[:1].upper() + w[1:] for w in s.split())
+
+
+def extract_story_elements(title: str, synopsis: str) -> dict:
+    """从剧名+简介抽取内容元素：人名、角色短语、高频词、冲突/反转/时间跳变标记。"""
+    text = synopsis or ""
+    low = text.lower()
+    toks = [w.strip("'") for w in re.findall(r"[A-Za-z']+", text)]
+    sents = re.split(r"(?<=[.!?])\s+", text) if text else []
+
+    # 人名：全文大写词，统计句首/句中位置——句中出现过（或句首出现≥2次）才算人名
+    caps_pos = {}
+    for s in sents:
+        ws = re.findall(r"[A-Za-z]{2,}", s)
+        for i, w in enumerate(ws):
+            if w[0].isupper():
+                c = caps_pos.setdefault(w, {"mid": 0, "first": 0})
+                c["first" if i == 0 else "mid"] += 1
+    names = [w for w, c in caps_pos.items()
+             if (c["mid"] > 0 or c["first"] > 1) and _is_name_word(w)]
+
+    # 高频实义词
+    freq = {}
+    for w in toks:
+        wl = w.lower()
+        if len(wl) >= 4 and wl not in STOPWORDS_ALL:
+            freq[wl] = freq.get(wl, 0) + 1
+    top_words = sorted(freq, key=lambda x: (-freq[x], x))
+
+    # 角色短语：连续两个实义词的 bigram，按词频之和排序
+    # 过滤：含人名的（They Took the Anya Sorensen ❌）、动词结尾/开头的（family fell ❌）
+    verb_tails = {"fell","destroy","destroys","destroyed","came","took","takes","gave","gives","made","makes","left","leaves","runs","ran","broke","breaks","found","finds","told","tells","asked","asks","gets","went","returns","return","married","marries","lost","loses","buys","bought","die","dies","died","forced","fled","flees","steals","stole","stolen","lied","hides","hid","hired","opens","opened","closes","closed","learns","learned","turns","turned","expires","expired","cuts","thrown","fabricates","fabricated","bursts","burst","falls","fallen","hands","handed","offers","offered","throws","exposes","exposed","reveals","revealed","becomes","became"}
+    name_set = {n.lower() for n in names}
+    phrases, seen_ph = [], set()
+    for i in range(len(toks) - 1):
+        a, b = toks[i].lower(), toks[i + 1].lower()
+        b_raw = toks[i + 1]
+        if (len(a) >= 4 and len(b) >= 4 and a not in STOPWORDS_ALL and b not in STOPWORDS_ALL):
+            ph = f"{a} {b}"
+            if ph in seen_ph:
+                continue
+            seen_ph.add(ph)
+            if a in name_set or b in name_set:
+                continue
+            if b_raw[0].isupper():  # 短语尾部是专有名词（wedding Kieran ❌）
+                continue
+            if b in verb_tails or a in verb_tails:
+                continue
+            phrases.append((freq.get(a, 0) + freq.get(b, 0), ph))
+    phrases.sort(key=lambda x: -x[0])
+    phrases = [p for _, p in phrases]
+
+    return {
+        "names": names[:4],
+        "top_words": top_words[:10],
+        "phrases": phrases[:6],
+        "conflict": any(k in low for k in CONFLICT_WORDS),
+        "reveal": any(k in low for k in REVEAL_WORDS),
+        "love": any(k in low for k in LOVE_WORDS),
+        "rich": any(k in low for k in RICH_WORDS),
+        "power": any(k in low for k in POWER_WORDS),
+        "time_jump": bool(re.search(r"\w+ (?:years|months|days) later|came back|returned", low)),
+        "years": (re.search(r"([A-Za-z]+|\d+) (?:years|months|days) later", low) or [None, None]).group(1)
+                  if re.search(r"([A-Za-z]+|\d+) (?:years|months|days) later", low) else None,
+    }
+
 
 def pick_title_word(title: str) -> str:
     words = [w for w in re.findall(r"[A-Za-z]{4,}", title or "")
@@ -394,17 +519,44 @@ def detect_genre(title: str, synopsis: str):
 
 
 def generate_keywords(title: str, synopsis: str, count: int = 4):
-    """生成 # 开头的推广关键词（3-20 个）。"""
+    """生成 # 开头的推广关键词（3-20 个）：题材标签 + 剧名/简介内容标签。"""
+    el = extract_story_elements(title, synopsis)
     gid = detect_genre(title, synopsis)
     tags = ["ShortDrama", "MiniSeries"]
     if gid:
-        genre_tags = next(r[2] for r in GENRE_RULES if r[0] == gid)
-        tags.extend(genre_tags)
+        tags.extend(next(r[2] for r in GENRE_RULES if r[0] == gid))
     else:
         tags.append("StoryTime")
-    w = pick_title_word(title)
-    if w:
-        tags.append(w)
+
+    # 内容标签：简介角色短语 / 高频词 / 人名（CamelCase 化，过滤过短的）
+    content = []
+    for ph in el["phrases"]:
+        t = _tag_camel(ph)
+        if len(t) >= 6 and t not in content:
+            content.append(t)
+    for n in el["names"]:
+        if n not in content:
+            content.append(n)
+    for w in el["top_words"]:
+        t = w.capitalize()
+        if len(t) >= 5 and t not in content:
+            content.append(t)
+    # 剧名内容词（简介之外再兜一层）
+    for w in re.findall(r"[A-Za-z]{4,}", title or ""):
+        t = w.capitalize()
+        if w.lower() not in STOPWORDS_ALL and t not in content:
+            content.append(t)
+    # 主题氛围标签按内容标记追加
+    if el["reveal"] and "BigReveal" not in tags:
+        tags.append("BigReveal")
+    if el["conflict"] and "ComebackStory" not in tags:
+        tags.append("ComebackStory")
+    if el["love"] and "Romance" not in tags:
+        tags.append("Romance")
+    if el["rich"] and "Billionaire" not in tags:
+        tags.append("Billionaire")
+
+    tags.extend(content)
     tags.extend(t for t in DEFAULT_TAGS if t not in tags)
     tags.extend(t for t in EXTRA_TAGS if t not in tags)
     seen, out = set(), []
@@ -441,18 +593,51 @@ GENERAL_TITLES = [
 
 
 def generate_titles(title: str, synopsis: str, count: int = 10):
-    """生成标题草稿（可编辑）。剧名词槽 → 题材模板 → 通用模板，均不重复。"""
+    """生成标题草稿（可编辑）：优先由简介内容元素（角色短语/人名/冲突/反转）拼装，
+    剧名词槽与题材模板兜底，全部不重复。"""
+    el = extract_story_elements(title, synopsis)
     gid = detect_genre(title, synopsis)
     key = pick_title_word(title)
+    phrase = el["phrases"][0].title() if el["phrases"] else ""   # 如 "Mountain Lodge"
+    phrase2 = el["phrases"][1].title() if len(el["phrases"]) > 1 else ""
+    name = el["names"][0] if el["names"] else ""
+    years = (el["years"] or "Five").capitalize()
+
     pool = []
+    # 1) 简介内容驱动的标题（冲突 / 反转 / 时间跳变 / 人物）
+    if phrase:
+        if el["conflict"]:
+            pool.extend([
+                f"They Took the {phrase}. She Took Everything Back.",
+                f"The {phrase} Was Never Theirs to Take.",
+                f"What They Did to the {phrase} Cost Them Everything.",
+            ])
+        if el["reveal"]:
+            pool.extend([
+                f"The Truth About the {phrase} Changed Everything.",
+                f"They Hid the {phrase}. The Truth Still Walked In.",
+            ])
+        if el["time_jump"]:
+            pool.append(f"{years} Years Later, the {phrase} Came Back to Them.")
+        if name:
+            pool.append(f"{name} and the {phrase}: The Story They Tried to Erase.")
+        if phrase2 and el["conflict"]:
+            pool.append(f"One {phrase}. One Lie. One {phrase2} Comeback.")
+    if name and not phrase:
+        pool.extend([
+            f"Everyone Lied About {name}. She Didn't.",
+            f"{name} Was Never the Weak One. They Just Weren't Watching.",
+            f"The Truth About {name} They Never Wanted Told.",
+        ])
+    # 2) 剧名词槽兜底
     if key:
         pool.extend([
             f"The Truth About {key} They Never Wanted Told.",
             f"{key}: The Story They Tried to Erase.",
             f"Everyone Lied About {key}. She Didn't.",
             f"{key} Changed Two Families Forever.",
-            f"The Night {key} Came Back, Everything Broke.",
         ])
+    # 3) 题材模板兜底
     if gid:
         pool.extend(next(r[3] for r in GENRE_RULES if r[0] == gid))
     pool.extend(GENERAL_TITLES)
@@ -652,6 +837,8 @@ class App(tk.Tk):
         self.minsize(900, 600)
         self.pool = []
         self.tabs = []  # list[DramaTab]
+        self._ui_queue = queue.Queue()
+        self._polling = False
 
         self._build_ui()
 
@@ -823,15 +1010,60 @@ class App(tk.Tk):
                 return
         self.progress_var.set("连接北斗 MCP 网关…")
         self.statusbar.config(text="正在通过 MCP 网关读取推广工作台待发布剧目…")
+        self._start_bg(self._bg_workbench(cfg))
 
+    def _bg_workbench(self, cfg):
         def work():
             try:
                 pending, items = fetch_workbench(cfg)
-                self.after(0, lambda: self._import_workbench_done(pending, items, None))
+                self._ui_queue.put(("workbench", pending, items, None))
             except Exception as e:
-                self.after(0, lambda: self._import_workbench_done(None, None, str(e)))
+                self._ui_queue.put(("workbench", None, None, str(e)))
+        return work
 
-        threading.Thread(target=work, daemon=True).start()
+    def _start_bg(self, target):
+        """后台线程只做计算，所有 UI 更新经队列回到主线程（跨线程调 Tk 会静默崩）。"""
+        threading.Thread(target=target, daemon=True).start()
+        if not self._polling:
+            self._polling = True
+            self.after(120, self._poll_ui_queue)
+
+    def _poll_ui_queue(self):
+        try:
+            while True:
+                msg = self._ui_queue.get_nowait()
+                kind = msg[0]
+                if kind == "progress":
+                    _, idx, total, note = msg
+                    self.progress_var.set(note or f"实时拉取任务页 {idx}/{total}")
+                elif kind == "pool":
+                    _, pool = msg
+                    self.pool = pool or []
+                    if not self.pool:
+                        self.progress_var.set("检索失败")
+                        self.statusbar.config(text="实时检索完成但未获得数据，请检查网络后重试。")
+                    else:
+                        self._do_match()
+                    self._polling = False
+                    return
+                elif kind == "match_error":
+                    self._match_error(msg[1])
+                    self._polling = False
+                    return
+                elif kind == "match_stats":
+                    _, reqs, n, failed, secs = msg
+                    self._fetch_note = (f"已实时访问任务页检索接口（{reqs} 个请求 / {n} 条 / "
+                                        f"{secs:.1f}s，未使用缓存）")
+                    if failed > reqs // 2:
+                        self._fetch_note += f"。注意：{failed} 个请求失败，结果可能不全，建议重试一次。"
+                elif kind == "workbench":
+                    _, pending, items, err = msg
+                    self._import_workbench_done(pending, items, err)
+                    self._polling = False
+                    return
+        except queue.Empty:
+            pass
+        self.after(120, self._poll_ui_queue)
 
     def _import_workbench_done(self, pending, items, err):
         if err:
@@ -880,7 +1112,9 @@ class App(tk.Tk):
                     tab.status_var.set("简介已就绪（工作台原文）")
             else:
                 tab.status_var.set("⚠ " + INCOMPLETE_NOTE + "，请手动粘贴")
-        self.pool = fetch_pool(force=False) if not self.pool else self.pool
+        if not self.pool:
+            _pool, _ = fetch_pool(force=False)
+            self.pool = _pool
         self.progress_var.set(f"已导入 {len(rows)} 部（{source}）")
         self.statusbar.config(text=f"已从推广工作台导入 {len(rows)} 部剧目，可点「匹配简介」补全后生成。")
 
@@ -889,27 +1123,28 @@ class App(tk.Tk):
         if not self.tabs:
             messagebox.showinfo(APP_NAME, "请先添加剧集（左侧剧名按行加入 / 手动添加 / 工作台导入）。")
             return
-        self.progress_var.set("实时检索任务页…")
-        self.statusbar.config(text="正在实时检索 inbeidou.cn/task 任务页数据源（全部排序组合，强制刷新，禁止缓存）…")
+        self.progress_var.set("实时检索 inbeidou.cn/task …")
+        self.statusbar.config(text="正在实时访问 https://inbeidou.cn/task 检索接口（全部排序组合，禁止缓存）…")
+        self._start_bg(self._bg_match())
 
-        def progress(idx, total):
-            self.after(0, lambda: self.progress_var.set(f"实时拉取任务页 {idx}/{total}"))
-
+    def _bg_match(self):
         def work():
+            t0 = time.time()
             try:
-                pool = fetch_pool(force=True, progress_cb=progress)
+                pool, failed = fetch_pool(force=True, progress_cb=lambda i, t: self._ui_queue.put(
+                    ("progress", i, t, f"实时访问 inbeidou.cn/task（{i}/{t}）…")))
             except Exception as e:
-                self.after(0, lambda: self.statusbar.config(text=f"匹配失败：{e}"))
+                log_match(f"实时检索失败: {e}")
+                self._ui_queue.put(("match_error", str(e)))
                 return
-            self.pool = pool
-            if not pool:
-                self.after(0, lambda: self.statusbar.config(
-                    text="实时检索失败（任务页数据源无返回）。请检查网络后重试。"))
-                self.after(0, lambda: self.progress_var.set("检索失败"))
-                return
-            self.after(0, lambda: self._do_match())
+            secs = time.time() - t0
+            self._ui_queue.put(("match_stats", len(THEATER_IDS) * 4 * 2, len(pool), failed, secs))
+            self._ui_queue.put(("pool", pool))
+        return work
 
-        threading.Thread(target=work, daemon=True).start()
+    def _match_error(self, err):
+        self.progress_var.set("检索失败")
+        self.statusbar.config(text=f"实时检索失败：{err}。请检查网络后重试（不会回退缓存）。")
 
     def _do_match(self):
         hit, miss, skip = 0, 0, 0
@@ -934,7 +1169,11 @@ class App(tk.Tk):
             tab.status_var.set("✗ 未匹配到——" + INCOMPLETE_NOTE + "，请手动粘贴简介")
             miss += 1
         self.progress_var.set(f"匹配完成：{hit} 成功 / {skip} 已有简介 / {miss} 待补")
-        self.statusbar.config(text="匹配完成。绿色=已就绪；黄色提示=请手动粘贴简介后重新生成。")
+        note = getattr(self, "_fetch_note", "")
+        if note:
+            self.statusbar.config(text=f"{note}。匹配完成：{hit} 成功 / {skip} 已有简介 / {miss} 待补。绿色=已就绪。")
+        else:
+            self.statusbar.config(text="匹配完成。绿色=已就绪；黄色提示=请手动粘贴简介后重新生成。")
 
     # ---------- 生成 / 复制 ----------
     def on_generate_all(self):
