@@ -16,9 +16,11 @@ License: MIT
 
 import base64
 import difflib
+import hashlib
 import json
 import os
 import queue
+import random
 import re
 import sys
 import tempfile
@@ -31,7 +33,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -403,6 +405,31 @@ GENRE_RULES = [
 
 STOPWORDS_TITLE = {"the","they","their","that","this","with","from","couldn","would","should","didn","doesn","wasn","weren","have","has","had","never","about","into","when","where","what"}
 
+# v1.4.0：常见动词形态（标题名词槽过滤用；promises/years 等名词不受影响）
+VERB_FORMS = {
+    "needed","needs","accepted","accepts","abandoned","abandons","begs","begged","beg",
+    "suffered","suffers","promised","trusted","believed","believes","deserved","saved",
+    "rescued","rescues","denied","blamed","chose","chosen","meant","owed","wanted",
+    "loved","hated","feared","waited","wait","waits","held","hold","holds","stood",
+    "walked","called","reached","knocked","answered","belong","belonged","apologized",
+    "admitted","watched","noticed","carried","paid","cost","won","failed","survived",
+    "returned","changed","change","changes","replaced","rejected","framed","ruined",
+    "cheated","mocked","humiliated","kicked","dumped","punished","hurt","hurts",
+    "deny","denies","arrived","arrives","disappeared","disappears","discovered",
+    "discovers","decided","decides","agreed","agrees","refused","refuses","signed",
+    "signs","swore","swears","vowed","vows","cried","cries","smiled","smiles",
+    "entered","enters","brought","bring","brings","sent","send","sends","kept","keep",
+    "keeps","put","puts","sat","sits","grew","hid","lied","lie","lies","fell","falls",
+    "took","taken","gave","given","made","left","ran","broke","found","told","asked",
+    "went","married","lost","bought","died","forced","fled","stole","stolen","opened",
+    "closed","learned","turned","expired","thrown","burst","handed","offered",
+    "exposed","revealed","became","kneels","kneel","kneeled","struggled","struggles",
+    "broken","hidden","forgiven","admit","admits","losing","searching","begging",
+    "trying","running","coming","taking","hiding","looking","falling","breaking",
+    "kneeling","struggling","marrying","forcing","framing","protecting","promising",
+    "rescuing","waiting","planning","regretted","regrets",
+}
+
 STOPWORDS_ALL = {
     "the","a","an","and","but","or","so","if","then","than","that","this","these","those",
     "he","she","it","they","them","his","her","their","him","its","we","our","you","your",
@@ -417,6 +444,12 @@ STOPWORDS_ALL = {
 }
 
 CONFLICT_WORDS = ["steal","stole","stolen","taken","took","rejected","reject","betray","betrayed","lied","lie","lying","force","forced","framed","frame","fired","broke","broken","ruin","ruined","destroy","destroyed","cheat","cheated","bullied","bully","humiliated","humiliate","mocked","replace","replaced","abandon","abandoned","kicked","dumped","divorce","punish","punished","hurt"]
+
+# 头衔/称谓词：不算人名（Alpha Kieran → 人名是 Kieran，不是 Alpha）
+HONORIFICS = {"Alpha","Luna","Beta","Omega","King","Queen","Lord","Lady","Sir","Mr","Mrs","Miss","Ms","Doctor","Doctor","Captain","General","Boss","Don","Prince","Princess"}
+
+# -ing 结尾但实际是名词的常用词（不受动词过滤）
+NOUN_ING = {"wedding","weddings","morning","mornings","evening","evenings","building","buildings","clothing","offering","offerings","landing","landings","warning","warnings"}
 REVEAL_WORDS = ["truth","revealed","reveal","secret","identity","discovered","discovery","exposed","expose","actually","real","disguise","hidden","found out","true","uncovered","unveiled"]
 LOVE_WORDS = ["love","loved","romance","romantic","married","marriage","wedding","bride","groom","heart","soulmate","fate","destiny","kiss"]
 RICH_WORDS = ["billionaire","ceo","chairman","company","empire","fortune","wealth","wealthy","capital","business","heir","heiress","tycoon","executive","conglomerate"]
@@ -449,7 +482,10 @@ def extract_story_elements(title: str, synopsis: str) -> dict:
                 c = caps_pos.setdefault(w, {"mid": 0, "first": 0})
                 c["first" if i == 0 else "mid"] += 1
     names = [w for w, c in caps_pos.items()
-             if (c["mid"] > 0 or c["first"] > 1) and _is_name_word(w)]
+             if (c["mid"] > 0 or c["first"] > 1) and _is_name_word(w)
+             and w not in HONORIFICS]  # Alpha/Luna/King 等头衔词不当人名
+    # 疑似人名全集（含只出现一次的，如 "Aria was..."）：高频词槽要避开
+    maybe_names = {w.lower() for w, c in caps_pos.items() if c["mid"] > 0 or c["first"] > 0}
 
     # 高频实义词
     freq = {}
@@ -461,12 +497,16 @@ def extract_story_elements(title: str, synopsis: str) -> dict:
 
     # 角色短语：连续两个实义词的 bigram，按词频之和排序
     # 过滤：含人名的（They Took the Anya Sorensen ❌）、动词结尾/开头的（family fell ❌）
-    verb_tails = {"fell","destroy","destroys","destroyed","came","took","takes","gave","gives","made","makes","left","leaves","runs","ran","broke","breaks","found","finds","told","tells","asked","asks","gets","went","returns","return","married","marries","lost","loses","buys","bought","die","dies","died","forced","fled","flees","steals","stole","stolen","lied","hides","hid","hired","opens","opened","closes","closed","learns","learned","turns","turned","expires","expired","cuts","thrown","fabricates","fabricated","bursts","burst","falls","fallen","hands","handed","offers","offered","throws","exposes","exposed","reveals","revealed","becomes","became"}
+    verb_tails = {"fell","destroy","destroys","destroyed","came","took","takes","gave","gives","made","makes","left","leaves","runs","ran","broke","breaks","found","finds","told","tells","asked","asks","gets","went","returns","return","married","marries","lost","loses","buys","bought","die","dies","died","forced","fled","flees","steals","stole","stolen","lied","hides","hid","hired","opens","opened","closes","closed","learns","learned","turns","turned","expires","expired","cuts","thrown","fabricates","fabricated","bursts","burst","falls","fallen","hands","handed","offers","offered","throws","exposes","exposed","reveals","revealed","becomes","became","admit","admits","regretted","regrets",
+                  # v1.4.0 补充：标题槽混入的动词性短语（needed rescue / the accepted 等）
+                  "needed","needs","accepted","accepts","abandoned","abandons","broken","begs","begged","beg","suffered","suffers","promised","promises","trusted","believed","believes","deserved","saved","rescued","rescues","denied","blamed","chose","chosen","meant","owed","wanted","loved","hated","feared","waited","wait","waits","grew","grown","held","hold","holds","stood","walked","called","reached","knocked","answered","belong","belonged","apologized","admitted","watched","noticed","carried","paid","cost","won","failed","survived","returned","changed","change","changes","replaced","replaces","rejected","rejects","framed","frames","ruined","ruins","cheated","cheats","mocked","mocks","humiliated","humiliates","kicked","dumped","punished","hurt","hurts","denied","deny","denies","arrived","arrives","disappeared","disappears","discovered","discovers","decided","decides","agreed","agrees","refused","refuses","signed","signs","swore","swears","vowed","vows","cried","cries","smiled","smiles","entered","enters","brought","bring","brings","sent","send","sends","kept","keep","keeps","put","puts","sat","sits","grew"}
     name_set = {n.lower() for n in names}
     phrases, seen_ph = [], set()
     for i in range(len(toks) - 1):
         a, b = toks[i].lower(), toks[i + 1].lower()
         b_raw = toks[i + 1]
+        a = a.replace("'", "")
+        b = b.replace("'", "")
         if (len(a) >= 4 and len(b) >= 4 and a not in STOPWORDS_ALL and b not in STOPWORDS_ALL):
             ph = f"{a} {b}"
             if ph in seen_ph:
@@ -478,12 +518,16 @@ def extract_story_elements(title: str, synopsis: str) -> dict:
                 continue
             if b in verb_tails or a in verb_tails:
                 continue
+            # v1.4.0：过去分词/动词式词尾（needed rescue / pack rejected ❌）
+            if a.endswith("ed") or b.endswith("ed"):
+                continue
             phrases.append((freq.get(a, 0) + freq.get(b, 0), ph))
     phrases.sort(key=lambda x: -x[0])
     phrases = [p for _, p in phrases]
 
     return {
         "names": names[:4],
+        "maybe_names": maybe_names,
         "top_words": top_words[:10],
         "phrases": phrases[:6],
         "conflict": any(k in low for k in CONFLICT_WORDS),
@@ -500,7 +544,10 @@ def extract_story_elements(title: str, synopsis: str) -> dict:
 def pick_title_word(title: str) -> str:
     words = [w for w in re.findall(r"[A-Za-z]{4,}", title or "")
              if w.lower() not in STOPWORDS_TITLE]
-    return max(words, key=len).title() if words else ""
+    good = [w for w in words if w.lower() not in VERB_FORMS
+            and not w.lower().endswith("ed")]
+    pick_from = good or words
+    return max(pick_from, key=len).title() if pick_from else ""
 
 DEFAULT_TAGS = ["ShortDrama", "MiniSeries", "DramaReels", "StoryTime", "MustWatch"]
 EXTRA_TAGS = ["ShortFilm", "WebSeries", "NewSeries", "WatchNow", "FullSeries",
@@ -569,86 +616,232 @@ def generate_keywords(title: str, synopsis: str, count: int = 4):
 
 
 GENERAL_TITLES = [
-    "The Nobody They Ignored Changed Everything.",
-    "One Decision. One Night. One New Life.",
-    "They Underestimated the Wrong Person.",
-    "The Truth Walked in When They Least Expected It.",
-    "She Was Never the Weak One. They Just Weren't Watching.",
-    "Everything Fell Apart the Moment She Stopped Asking.",
+    "She Stopped Asking for Permission. Everything Changed.",
+    "The Ending They Never Saw Coming.",
     "The Quiet One at the Table Held All the Cards.",
     "What They Did in the Dark Came Out at Dinner.",
-    "She Didn't Fight Back. She Just Won.",
-    "The Ending They Never Saw Coming.",
-    "She Stopped Asking for Permission. Everything Changed.",
-    "They Buried Her Name. She Built an Empire on It.",
-    "The Final Word Was Hers. They Just Didn't Know It Yet.",
-    "One Room. One Secret. One Way Out.",
-    "The Person They Forgot Came Back First.",
-    "He Showed Her the Door. She Bought the Building.",
+    "They Underestimated the Wrong Person.",
     "The Last Laugh Wasn't Loud. It Was Final.",
     "Everyone Chose a Side. The Wrong One.",
     "She Didn't Need a Hero. She Needed Ten Minutes.",
     "The Truth Cost Nothing. It Changed Everything.",
+    "One Room. One Secret. One Way Out.",
 ]
 
 
-def generate_titles(title: str, synopsis: str, count: int = 10):
-    """生成标题草稿（可编辑）：优先由简介内容元素（角色短语/人名/冲突/反转）拼装，
-    剧名词槽与题材模板兜底，全部不重复。"""
+def _title_elements(title: str, synopsis: str):
+    """标题可注入的内容元素池：(文本, 是否人名)。
+    名词短语（角色短语/剧名词/高频词）用于 the {X} 槽；人名只进人名槽，
+    避免 'The Eve Walked In' 这类硬套。"""
     el = extract_story_elements(title, synopsis)
+    nouns, names, seen = [], [], set()
+
+    def add(w, is_name=False):
+        w = (w or "").strip().replace("'", "")
+        if not w or len(w) < 3 or w.lower() in seen:
+            return
+        lw = w.lower()
+        # 名词槽只收名词性元素：滤动词式词尾（needed/losing ❌，promises/wedding ✓）
+        if not is_name and (lw.endswith("ed") or lw in VERB_FORMS
+                            or (lw.endswith("ing") and lw not in NOUN_ING)):
+            return
+        seen.add(lw)
+        (names if is_name else nouns).append(w)
+
+    for n in el["names"]:
+        add(n, is_name=True)
+    for p in el["phrases"]:
+        add(p.title())
+    add(pick_title_word(title))
+    for w in re.findall(r"[A-Za-z]{4,}", title or ""):
+        if w.lower() not in STOPWORDS_ALL:
+            add(w.title())
+    for w in el["top_words"][:5]:
+        if w in el.get("maybe_names", set()):
+            continue  # 疑似人名不进名词槽（Aria ❌）
+        add(w.capitalize())
+    return el, nouns, names
+
+
+def _title_skeleton(t: str, elements) -> str:
+    """把标题里的内容元素替换成占位符，得到句式骨架指纹（同骨架限流用）。"""
+    sk = t
+    for e in elements:
+        if e:
+            sk = re.sub(re.escape(e), "{E}", sk, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", sk).lower().strip()
+
+
+def _pick_titles(cands, fallback, elements, count, rng):
+    """选标题：精确去重 + 近似去重（≥0.80 视为重复）+ 同句式骨架最多 2 条。"""
+    picked, seen, skels = [], set(), {}
+
+    def take(pool):
+        for t in pool:
+            low = re.sub(r"\s+", " ", t.lower()).strip()
+            if low in seen:
+                continue
+            if any(difflib.SequenceMatcher(None, low, p.lower()).ratio() >= 0.80
+                   for p in picked):
+                continue
+            sk = _title_skeleton(t, elements)
+            if skels.get(sk, 0) >= 2:
+                continue
+            seen.add(low)
+            skels[sk] = skels.get(sk, 0) + 1
+            picked.append(t)
+            if len(picked) >= count:
+                return True
+        return False
+
+    pool1 = list(cands)
+    rng.shuffle(pool1)
+    if not take(pool1):
+        pool2 = list(fallback)
+        rng.shuffle(pool2)
+        take(pool2)
+    return picked[:count]
+
+
+def generate_titles(title: str, synopsis: str, count: int = 10):
+    """生成标题草稿（可编辑）。v1.4.0 重写：
+    - 内容驱动：每条标题注入剧名/简介元素（角色短语、人名、剧名实义词、高频词），
+      元素轮换避免集中在同一个词上；
+    - 多样化：模板槽按 (剧名+简介) 的确定性散列洗牌——同剧重生成结果一致（可复现），
+      不同剧句式顺序不同，跨剧不再共用同一批通用句；
+    - 去重：精确 + 近似（相似度 ≥0.80）+ 同句式骨架限流（最多 2 条）；
+    - 数量保证：内容槽不足时才用题材/通用兜底补足到 count。"""
+    el, nouns, names = _title_elements(title, synopsis)
     gid = detect_genre(title, synopsis)
-    key = pick_title_word(title)
-    phrase = el["phrases"][0].title() if el["phrases"] else ""   # 如 "Mountain Lodge"
-    phrase2 = el["phrases"][1].title() if len(el["phrases"]) > 1 else ""
-    name = el["names"][0] if el["names"] else ""
+    seed = hashlib.sha1(
+        f"{(title or '').strip()}|{(synopsis or '').strip()}".encode("utf-8")
+    ).hexdigest()
+    rng = random.Random(seed)
+    count = max(1, min(MAX_TITLES, count))
+
+    name = names[0] if names else ""
+    name2 = names[1] if len(names) > 1 else ""
     years = (el["years"] or "Five").capitalize()
 
-    pool = []
-    # 1) 简介内容驱动的标题（冲突 / 反转 / 时间跳变 / 人物）
-    if phrase:
-        if el["conflict"]:
-            pool.extend([
-                f"They Took the {phrase}. She Took Everything Back.",
-                f"The {phrase} Was Never Theirs to Take.",
-                f"What They Did to the {phrase} Cost Them Everything.",
-            ])
-        if el["reveal"]:
-            pool.extend([
-                f"The Truth About the {phrase} Changed Everything.",
-                f"They Hid the {phrase}. The Truth Still Walked In.",
-            ])
-        if el["time_jump"]:
-            pool.append(f"{years} Years Later, the {phrase} Came Back to Them.")
-        if name:
-            pool.append(f"{name} and the {phrase}: The Story They Tried to Erase.")
-        if phrase2 and el["conflict"]:
-            pool.append(f"One {phrase}. One Lie. One {phrase2} Comeback.")
-    if name and not phrase:
-        pool.extend([
+    # 名词元素轮换器：洗牌后循环取用，相邻槽尽量用不同元素
+    rot = list(nouns)
+    rng.shuffle(rot)
+    pos = {"i": 0}
+
+    def X():
+        if not rot:
+            return ""
+        v = rot[pos["i"] % len(rot)]
+        pos["i"] += 1
+        return v
+
+    def be(x):  # 单复数系动词（The Packs Were / The Lodge Was）
+        return "Were" if x and x[-1:].lower() == "s" else "Was"
+
+    def plural(x):  # 元素是否复数（粗判：以 s 结尾）
+        return bool(x) and x[-1:].lower() == "s"
+
+    cands = []
+
+    # A. 名词内容槽（无元素时自动跳过）
+    x = X()
+    if x:
+        cands.extend([
+            f"The {x} {be(x)} Never Theirs to Take.",
+            f"Everything Changed the Night the {x} Disappeared.",
+            f"The Truth About the {x} Changed Everything.",
+            f"They Underestimated the {x}. It Cost Them Everything.",
+            f"The {x} Everyone Believed {be(x)} a Lie.",
+            f"All It Took Was the {x}." if plural(x) else f"All It Took Was One {x}.",
+            f"The {x} Decided Everything. They Just Didn't Know It Yet.",
+            f"The {x} Changed Every Promise in That House." if plural(x)
+            else f"One {x} Changed Every Promise in That House.",
+        ])
+    x = X()
+    if x:
+        cands.extend([
+            f"No One Saw the {x} Coming.",
+            f"The {x} They Laughed at Won in the End.",
+            f"They Drew the Line. The {x} Crossed It.",
+            f"The {x} Held a Secret Nobody Dared to Open.",
+            f"It All Came Down to the {x}.",
+            f"The {x}. One Decision. One New Life." if plural(x)
+            else f"One {x}. One Decision. One New Life.",
+        ])
+    x = X()
+    if x:
+        cands.extend([
+            f"The {x} {be(x)} Louder Than All Their Lies.",
+            f"They Buried the {x}. It Grew Back Louder.",
+            f"The {x} Walked In When They Least Expected It.",
+        ])
+
+    # B. 人名槽（有人名才启用）
+    if name:
+        cands.extend([
             f"Everyone Lied About {name}. She Didn't.",
             f"{name} Was Never the Weak One. They Just Weren't Watching.",
             f"The Truth About {name} They Never Wanted Told.",
+            f"They Chose Sides. {name} Chose Herself.",
         ])
-    # 2) 剧名词槽兜底
-    if key:
-        pool.extend([
-            f"The Truth About {key} They Never Wanted Told.",
+        y = X()
+        if y:
+            cands.extend([
+                f"{name} and the {y}: The Story They Tried to Erase.",
+                f"{name} Walked Away. The {y} Followed.",
+                f"They Underestimated {name}. Then Came the {y}.",
+            ])
+    if name2 and el["conflict"]:
+        cands.append(f"{name} and {name2}. Only One of Them Told the Truth.")
+
+    # C. 时间跳变槽
+    if el["time_jump"]:
+        y = X()
+        if y:
+            cands.extend([
+                f"{years} Years Later, the {y} Came Back to Them.",
+                f"{years} Years of Silence Ended With One {y}.",
+            ])
+        else:
+            cands.append(f"{years} Years Later, Everything They Said Came Undone.")
+
+    # D. 剧名词槽（剧名本身进标题，加强剧名关联）
+    key = pick_title_word(title)
+    if key and key.lower() not in {n.lower() for n in names}:
+        cands.extend([
             f"{key}: The Story They Tried to Erase.",
-            f"Everyone Lied About {key}. She Didn't.",
-            f"{key} Changed Two Families Forever.",
+            f"What Happened to {key} Was Never an Accident.",
+            f"{key} Changed Every Rule in That House.",
         ])
-    # 3) 题材模板兜底
+
+    # E. 内容标记槽（冲突/反转/情感/权力，各限 1-2 条）
+    if el["conflict"]:
+        y = X()
+        if y:
+            cands.extend([
+                f"They Took the {y}. She Took Everything Back.",
+                f"What They Did to the {y} Could Not Be Undone.",
+            ])
+    if el["reveal"]:
+        y = X()
+        if y:
+            cands.append(f"The Secret Behind the {y} Rewrote Every Rule.")
+    if el["love"]:
+        y = X()
+        if y:
+            cands.append(f"They Promised Forever. The {y} Said Otherwise.")
+    if el["power"] or el["rich"]:
+        y = X()
+        if y:
+            cands.append(f"The {y} Belonged to the Wrong Family. Until Tonight.")
+
+    # F. 题材槽（最多 2 条，洗牌取样，降低跨剧重复）
     if gid:
-        pool.extend(next(r[3] for r in GENRE_RULES if r[0] == gid))
-    pool.extend(GENERAL_TITLES)
-    seen, out = set(), []
-    for t in pool:
-        if t.lower() not in seen:
-            seen.add(t.lower())
-            out.append(t)
-        if len(out) >= max(1, min(MAX_TITLES, count)):
-            break
-    return out[:max(1, min(MAX_TITLES, count))]
+        gtitles = list(next(r[3] for r in GENRE_RULES if r[0] == gid))
+        rng.shuffle(gtitles)
+        cands.extend(gtitles[:2])
+
+    return _pick_titles(cands, GENERAL_TITLES, nouns + names, count, rng)
 
 
 # ---------------------------------------------------------------- GUI
