@@ -34,7 +34,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.6.1"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -67,8 +67,7 @@ DEFAULT_MCP_URL = ("http://gw-da5tlpem1hktoldq1bc0-w2wqzerrpavaetkkal-cn-beijing
 LLM_DEFAULT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_DEFAULT_MODEL = "qwen-plus"
 LLM_TIMEOUT = 60
-LLM_TITLE_MAX_WORDS = 20  # AI 标题单词数上限，超长在解析层截断（不影响生成流程）
-DEFAULT_TITLE_COUNT = 2   # 默认标题条数
+DEFAULT_TITLE_COUNT = 2   # 默认标题条数（AI/本地规则一致；AI 超长标题不截断，原样保留）
 
 INCOMPLETE_NOTE = "页面未提供完整简介"
 
@@ -945,8 +944,7 @@ def _llm_parse_pack(text, kw_count, ti_count):
             it = "#" + it.replace(" ", "").replace("#", "")
         kws.append(it)
     titles = clean_list(data.get("titles"), ti_count)
-    # 字数上限：超长标题按单词边界截断（保条数、不中断流程）
-    titles = [" ".join(x.split()[:LLM_TITLE_MAX_WORDS]) for x in titles]
+    # 注：超长标题不做截断，原样保留（避免标题不完整）；字数控制交由提示词约束
     if not kws or not titles:
         raise RuntimeError("模型返回的 JSON 缺少 keywords/titles 内容")
     return {"keywords": kws, "titles": titles}
@@ -964,7 +962,7 @@ def llm_generate_pack(title, synopsis, kw_count, ti_count, cfg, timeout=LLM_TIME
         "Rules:\n"
         f"- keywords: exactly {kw_count} hashtag keywords in English, each starts with '#', "
         "no spaces inside; mix genre tags, character/relationship phrases, plot hooks, emotion words.\n"
-        f"- titles: exactly {ti_count} English titles, 8-{LLM_TITLE_MAX_WORDS} words each, varied sentence "
+        f"- titles: exactly {ti_count} English titles, 8-20 words each, varied sentence "
         "structures and hooks; every title must reference this story's specifics; no near-duplicates.\n"
         f"- Banned words (never use): {', '.join(LLM_BANNED)}.\n"
         "- The synopsis language sets the copy language (English synopsis → English copy).\n"
