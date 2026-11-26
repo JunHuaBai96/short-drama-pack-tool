@@ -27,13 +27,14 @@ import tempfile
 import threading
 import time
 import unicodedata
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -62,6 +63,11 @@ THEATER_IDS = [
 DEFAULT_MCP_URL = ("http://gw-da5tlpem1hktoldq1bc0-w2wqzerrpavaetkkal-cn-beijing"
                    ".alicloudapi.com/mcp-servers/beidou-matrix-publish")
 
+# LLM：默认阿里百炼（DashScope）OpenAI 兼容模式；密钥只存本地 config.json，不硬编码
+LLM_DEFAULT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
+LLM_DEFAULT_MODEL = "qwen-plus"
+LLM_TIMEOUT = 60
+
 INCOMPLETE_NOTE = "页面未提供完整简介"
 
 MAX_KEYWORDS = 20
@@ -70,7 +76,8 @@ MAX_TITLES = 20
 # ---------------------------------------------------------------- 配置
 
 def load_config():
-    cfg = {"mcp_url": DEFAULT_MCP_URL, "api_key": ""}
+    cfg = {"mcp_url": DEFAULT_MCP_URL, "api_key": "",
+           "llm_api_key": "", "llm_base_url": LLM_DEFAULT_BASE, "llm_model": LLM_DEFAULT_MODEL}
     try:
         with open(CONFIG_FILE, "r", encoding="utf-8") as f:
             d = json.load(f)
@@ -859,6 +866,116 @@ DRAMA_TEMPLATE = """【剧名】{title}
 """
 
 
+# ---------------------------------------------------------------- LLM 生成（默认阿里百炼千问）
+
+LLM_BANNED = ("kill", "murder", "dead", "death", "die", "died", "blood", "suicide",
+              "arrest", "jail", "prison", "inmate", "obsession", "obsessed", "affair",
+              "cheating", "pregnant", "pregnancy", "heat", "knot", "fangs", "desire")
+
+
+def _llm_chat(cfg, messages, timeout=LLM_TIMEOUT, retries=1):
+    """OpenAI 兼容 chat/completions（默认 DashScope 兼容模式）。返回首条回复文本。"""
+    base = (cfg.get("llm_base_url") or LLM_DEFAULT_BASE).strip().rstrip("/")
+    key = (cfg.get("llm_api_key") or "").strip()
+    model = (cfg.get("llm_model") or LLM_DEFAULT_MODEL).strip()
+    if not key:
+        raise RuntimeError("未配置 LLM API Key")
+    url = base + "/chat/completions"
+    payload = json.dumps({
+        "model": model,
+        "messages": messages,
+        "temperature": 0.8,
+    }).encode("utf-8")
+    last_err = None
+    for attempt in range(retries + 1):
+        try:
+            req = urllib.request.Request(url, data=payload, method="POST", headers={
+                "Authorization": f"Bearer {key}",
+                "Content-Type": "application/json",
+                "User-Agent": f"{APP_NAME}/{APP_VERSION}",
+            })
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                body = json.loads(r.read().decode("utf-8"))
+            text = ((body or {}).get("choices") or [{}])[0].get("message", {}).get("content") or ""
+            if not text.strip():
+                raise RuntimeError("模型返回内容为空")
+            return text
+        except urllib.error.HTTPError as e:
+            detail = ""
+            try:
+                detail = e.read().decode("utf-8")[:300]
+            except Exception:
+                pass
+            last_err = f"HTTP {e.code}（{detail or e.reason}）"
+            if e.code in (401, 403, 404):  # 鉴权/地址错误重试无意义
+                break
+        except Exception as e:
+            last_err = str(e) or e.__class__.__name__
+        if attempt < retries:
+            time.sleep(1.0)
+    raise RuntimeError(f"LLM 调用失败：{last_err}")
+
+
+def _llm_parse_pack(text, kw_count, ti_count):
+    """从模型回复中稳健解析 JSON 包：剥代码围栏、截取首尾大括号、校验并去重。"""
+    s = text.strip()
+    s = re.sub(r"^```(?:json)?\s*|\s*```$", "", s, flags=re.MULTILINE).strip()
+    i, j = s.find("{"), s.rfind("}")
+    if i < 0 or j <= i:
+        raise RuntimeError("模型未返回 JSON（无法解析）")
+    data = json.loads(s[i:j + 1])
+    kws, titles = [], []
+
+    def clean_list(items, want, prefix_ok=None):
+        seen, out = set(), []
+        for it in items or []:
+            if not isinstance(it, str):
+                continue
+            w = " ".join(it.split()).strip()
+            if not w or w.lower() in seen:
+                continue
+            seen.add(w.lower())
+            out.append(w)
+        return out[:want]
+
+    for it in clean_list(data.get("keywords"), kw_count):
+        if not it.startswith("#"):
+            it = "#" + it.replace(" ", "").replace("#", "")
+        kws.append(it)
+    titles = clean_list(data.get("titles"), ti_count)
+    if not kws or not titles:
+        raise RuntimeError("模型返回的 JSON 缺少 keywords/titles 内容")
+    return {"keywords": kws, "titles": titles}
+
+
+def llm_generate_pack(title, synopsis, kw_count, ti_count, cfg, timeout=LLM_TIMEOUT):
+    """调用用户配置的 LLM，按剧名+简介生成关键词与标题。失败抛 RuntimeError。"""
+    kw_count = max(3, min(MAX_KEYWORDS, kw_count))
+    ti_count = max(5, min(MAX_TITLES, ti_count))
+    sys_prompt = (
+        "You are a promotion copywriter for Facebook short-drama (vertical drama) ads. "
+        "Given a drama title and its official synopsis, produce promotion copy tied to THIS "
+        "story's specific plot elements (character names, relationships, the central conflict, "
+        "the reversal). Do not write generic copy that could fit any drama.\n"
+        "Rules:\n"
+        f"- keywords: exactly {kw_count} hashtag keywords in English, each starts with '#', "
+        "no spaces inside; mix genre tags, character/relationship phrases, plot hooks, emotion words.\n"
+        f"- titles: exactly {ti_count} English titles, 8-20 words each, varied sentence "
+        "structures and hooks; every title must reference this story's specifics; no near-duplicates.\n"
+        f"- Banned words (never use): {', '.join(LLM_BANNED)}.\n"
+        "- The synopsis language sets the copy language (English synopsis → English copy).\n"
+        'Return ONLY valid JSON: {"keywords": ["#...", ...], "titles": ["...", ...]}'
+    )
+    user_prompt = (f"Drama title: {title}\n\n"
+                   f"Synopsis:\n{synopsis or '（not provided; infer from the title only）'}\n\n"
+                   f"Generate {kw_count} keywords and {ti_count} titles now.")
+    text = _llm_chat(cfg, [{"role": "system", "content": sys_prompt},
+                           {"role": "user", "content": user_prompt}])
+    pack = _llm_parse_pack(text, kw_count, ti_count)
+    log_match(f"LLM 生成成功: {title}（kw={len(pack['keywords'])} ti={len(pack['titles'])}）")
+    return pack
+
+
 class DramaTab:
     """一部剧的编辑标签页。"""
 
@@ -868,6 +985,7 @@ class DramaTab:
         self.status_var = tk.StringVar(value="待匹配简介")
         self.keyword_count = 4
         self.title_count = 10
+        self._llm_busy = False  # AI 生成进行中（防重复点击）
 
         head = ttk.Frame(self.frame)
         head.pack(fill="x", padx=6, pady=(6, 2))
@@ -920,6 +1038,8 @@ class DramaTab:
         return self.title_var.get().strip()
 
     def generate(self):
+        """生成入口：配置了 LLM Key → AI 生成（后台线程，失败自动回退本地规则）；
+        未配置 → 直接本地规则生成（原 v1.4.0 逻辑）。"""
         title = self.current_title()
         synopsis = self.synopsis.get("1.0", "end").strip()
         if not title:
@@ -933,16 +1053,59 @@ class DramaTab:
             self.title_count = int(self.ti_spin.get())
         except Exception:
             self.title_count = 10
-        kws = generate_keywords(title, synopsis, self.keyword_count)
-        titles = generate_titles(title, synopsis, self.title_count)
-        self.keywords.set(" ".join(kws))
-        self.titles.delete("1.0", "end")
-        self.titles.insert("1.0", "\n".join(titles))
-        self.render_result()
-        if not synopsis:
-            self.status_var.set("⚠ 未提供简介——" + INCOMPLETE_NOTE + "，请手动粘贴")
+        cfg = load_config()
+        if cfg.get("llm_api_key"):
+            if self._llm_busy:
+                self.status_var.set("AI 生成中，请等这轮完成…")
+                return
+            self._llm_busy = True
+            self.status_var.set("AI 生成中…（失败会自动回退本地规则）")
+            # 必须经 _start_bg：它同时启动 UI 队列轮询，否则结果永远回不来
+            _ROOT._start_bg(self._llm_worker(cfg, title, synopsis))
         else:
-            self.status_var.set("已生成 ✓（可编辑后复制）")
+            self._apply_pack(self._local_pack(title, synopsis), note="本地规则")
+
+    def _local_pack(self, title, synopsis):
+        return {"keywords": generate_keywords(title, synopsis, self.keyword_count),
+                "titles": generate_titles(title, synopsis, self.title_count)}
+
+    def _llm_worker(self, cfg, title, synopsis):
+        # 后台线程只做网络与解析，UI 更新经队列回主线程（跨线程调 Tk 在打包 exe 里会静默崩）
+        def work():
+            try:
+                pack = llm_generate_pack(title, synopsis, self.keyword_count,
+                                         self.title_count, cfg)
+                pack["_ai"] = True
+                _ROOT._ui_queue.put(("llm", self, pack, None))
+            except Exception as e:
+                log_match(f"LLM 生成失败: {title} → {e}")
+                _ROOT._ui_queue.put(("llm", self, None, str(e)))
+        return work
+
+    def _llm_done(self, pack, err):
+        self._llm_busy = False
+        title = self.current_title()
+        synopsis = self.synopsis.get("1.0", "end").strip()
+        if pack:
+            self._apply_pack(pack, note="AI")
+            return
+        self._apply_pack(self._local_pack(title, synopsis), note=None, llm_error=err)
+
+    def _apply_pack(self, pack, note="AI", llm_error=None):
+        self.keywords.set(" ".join(pack["keywords"]))
+        self.titles.delete("1.0", "end")
+        self.titles.insert("1.0", "\n".join(pack["titles"]))
+        self.render_result()
+        synopsis = self.synopsis.get("1.0", "end").strip()
+        tail = f"（{note} 生成 ✓，可编辑后复制）"
+        if llm_error:
+            self.status_var.set(f"⚠ AI 生成失败：{llm_error}。已用本地规则兜底生成。")
+        elif not synopsis:
+            self.status_var.set("⚠ AI 已生成，但未提供简介——" + INCOMPLETE_NOTE +
+                                "，建议补全简介后重新生成")
+        else:
+            self.status_var.set("AI 已生成 ✓" if note == "AI" else
+                                "已生成 ✓（本地规则；配置 LLM Key 可获得更贴剧情的结果）")
 
     def build_result_text(self):
         title = self.current_title()
@@ -1044,7 +1207,7 @@ class App(tk.Tk):
         ttk.Button(row1, text="＋ 手动添加剧名", command=self.on_add_manual).pack(side="left")
         ttk.Button(row1, text="1️⃣ 导入北斗推广工作台待发布剧目",
                    command=self.on_import_workbench).pack(side="left", padx=6)
-        ttk.Button(row1, text="⚙ 北斗 API Key", command=self.open_settings).pack(side="left")
+        ttk.Button(row1, text="⚙ 设置（北斗 / LLM）", command=self.open_settings).pack(side="left")
         ttk.Button(row1, text="2️⃣ 匹配简介（实时检索任务页）",
                    command=self.on_match_all).pack(side="left", padx=6)
         ttk.Button(row1, text="🗑 删除当前剧集", command=self.on_delete_current).pack(side="left")
@@ -1154,7 +1317,7 @@ class App(tk.Tk):
     def open_settings(self):
         cfg = load_config()
         dialog = tk.Toplevel(self)
-        dialog.title("北斗 API Key 设置")
+        dialog.title("设置 · 北斗 / LLM")
         dialog.transient(self)
         dialog.grab_set()
         dialog.resizable(False, False)
@@ -1165,17 +1328,80 @@ class App(tk.Tk):
         url_var = tk.StringVar(value=cfg.get("mcp_url") or DEFAULT_MCP_URL)
         ttk.Entry(dialog, textvariable=url_var, width=72).pack(padx=12, fill="x")
 
-        ttk.Label(dialog, text="API Key（headers.x-api-key，北斗后台获取）",
+        ttk.Label(dialog, text="北斗 API Key（headers.x-api-key，北斗后台获取）",
                   padding=(12, 8, 12, 0)).pack(fill="x")
         key_var = tk.StringVar(value=cfg.get("api_key") or "")
         ttk.Entry(dialog, textvariable=key_var, width=72, show="*").pack(padx=12, fill="x")
 
+        ttk.Separator(dialog).pack(fill="x", padx=12, pady=(10, 2))
+        ttk.Label(dialog, text="—— LLM 生成（留空 Key 则用本地规则兜底）——",
+                  foreground="#555").pack(fill="x", padx=12)
+        ttk.Label(dialog, text="LLM API Key（默认阿里百炼 DashScope：sk-… 开头；只在本地 config.json 保存）",
+                  padding=(12, 4, 12, 0)).pack(fill="x")
+        llm_key_var = tk.StringVar(value=cfg.get("llm_api_key") or "")
+        ttk.Entry(dialog, textvariable=llm_key_var, width=72, show="*").pack(padx=12, fill="x")
+
+        row_llm = ttk.Frame(dialog)
+        row_llm.pack(fill="x", padx=12)
+        c1 = ttk.Frame(row_llm); c1.pack(side="left", fill="x", expand=True)
+        c2 = ttk.Frame(row_llm); c2.pack(side="left", fill="x", expand=True, padx=(8, 0))
+        ttk.Label(c1, text="Base URL（OpenAI 兼容，默认阿里百炼）",
+                  padding=(0, 4, 0, 0)).pack(fill="x")
+        base_var = tk.StringVar(value=cfg.get("llm_base_url") or LLM_DEFAULT_BASE)
+        ttk.Entry(c1, textvariable=base_var).pack(fill="x")
+        ttk.Label(c2, text="模型（默认 qwen-plus）", padding=(0, 4, 0, 0)).pack(fill="x")
+        model_var = tk.StringVar(value=cfg.get("llm_model") or LLM_DEFAULT_MODEL)
+        ttk.Entry(c2, textvariable=model_var).pack(fill="x")
+
+        test_var = tk.StringVar(value="")
+
+        def run_test():
+            # 主线程先读齐配置；worker 只做网络请求；结果由主线程 after 轮询取回
+            test_cfg = {"llm_api_key": llm_key_var.get().strip(),
+                        "llm_base_url": base_var.get().strip() or LLM_DEFAULT_BASE,
+                        "llm_model": model_var.get().strip() or LLM_DEFAULT_MODEL}
+            result = {"msg": None}
+            test_var.set("测试中…（最长约 30 秒）")
+            test_btn.state(["disabled"])
+
+            def work():
+                try:
+                    pack = llm_generate_pack("The Lodge They Couldn't Steal",
+                                             "A woman inherits a mountain lodge, but the family "
+                                             "that tried to steal it returns with a claim no one "
+                                             "expected.", 3, 2, test_cfg, timeout=30)
+                    result["msg"] = (f"连接成功 ✓（返回 {len(pack['keywords'])} 关键词 / "
+                                     f"{len(pack['titles'])} 标题）")
+                except Exception as e:
+                    result["msg"] = f"测试失败 ✗ {e}"
+
+            threading.Thread(target=work, daemon=True).start()
+
+            def check():
+                if result["msg"] is not None:
+                    test_var.set(result["msg"])
+                    test_btn.state(["!disabled"])
+                else:
+                    dialog.after(200, check)
+
+            dialog.after(200, check)
+
+        test_row = ttk.Frame(dialog)
+        test_row.pack(fill="x", padx=12, pady=(8, 0))
+        test_btn = ttk.Button(test_row, text="测试连接", command=run_test)
+        test_btn.pack(side="left")
+        ttk.Label(test_row, textvariable=test_var, foreground="#0a7d32").pack(side="left", padx=8)
+
         def save():
             cfg["mcp_url"] = url_var.get().strip() or DEFAULT_MCP_URL
             cfg["api_key"] = key_var.get().strip()
+            cfg["llm_api_key"] = llm_key_var.get().strip()
+            cfg["llm_base_url"] = base_var.get().strip() or LLM_DEFAULT_BASE
+            cfg["llm_model"] = model_var.get().strip() or LLM_DEFAULT_MODEL
             if save_config(cfg):
                 saved["ok"] = True
-                self.statusbar.config(text="北斗 API Key 已保存（本地 config.json）。")
+                mode = "AI 生成已启用" if cfg["llm_api_key"] else "未配置 LLM Key（本地规则生成）"
+                self.statusbar.config(text=f"设置已保存（本地 config.json）。{mode}。")
             else:
                 messagebox.showerror(APP_NAME, "保存失败：无法写入配置文件。", parent=dialog)
             dialog.destroy()
@@ -1249,6 +1475,10 @@ class App(tk.Tk):
                                         f"{secs:.1f}s，未使用缓存）")
                     if failed > reqs // 2:
                         self._fetch_note += f"。注意：{failed} 个请求失败，结果可能不全，建议重试一次。"
+                elif kind == "llm":
+                    _, tab, pack, err = msg
+                    if tab in self.tabs:  # 生成期间被删除的页不再回写
+                        tab._llm_done(pack, err)
                 elif kind == "workbench":
                     _, pending, items, err = msg
                     self._import_workbench_done(pending, items, err)
@@ -1373,9 +1603,15 @@ class App(tk.Tk):
         if not self.tabs:
             messagebox.showinfo(APP_NAME, "还没有剧集。")
             return
+        n_ai = sum(1 for t in self.tabs if load_config().get("llm_api_key"))
         for tab in self.tabs:
             tab.generate()
-        self.statusbar.config(text="已全部生成（标题为草稿，可直接在各剧页修改后复制）。")
+        if n_ai:
+            self.statusbar.config(
+                text=f"已为 {n_ai}/{len(self.tabs)} 部发起 AI 生成（失败自动回退本地规则），"
+                     "各剧页状态栏会逐个就绪。")
+        else:
+            self.statusbar.config(text="未配置 LLM Key，已按本地规则生成（⚙ 设置里可配置阿里百炼）。")
 
     def on_copy_all(self):
         if not self.tabs:
