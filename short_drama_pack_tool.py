@@ -34,7 +34,7 @@ import tkinter as tk
 from tkinter import ttk, messagebox
 
 APP_NAME = "ShortDramaPackTool"
-APP_VERSION = "1.5.0"
+APP_VERSION = "1.6.0"
 CACHE_DIR = os.path.join(os.environ.get("LOCALAPPDATA", tempfile.gettempdir()), APP_NAME)
 CACHE_FILE = os.path.join(CACHE_DIR, "pool_cache.json")
 CONFIG_FILE = os.path.join(CACHE_DIR, "config.json")
@@ -67,6 +67,8 @@ DEFAULT_MCP_URL = ("http://gw-da5tlpem1hktoldq1bc0-w2wqzerrpavaetkkal-cn-beijing
 LLM_DEFAULT_BASE = "https://dashscope.aliyuncs.com/compatible-mode/v1"
 LLM_DEFAULT_MODEL = "qwen-plus"
 LLM_TIMEOUT = 60
+LLM_TITLE_MAX_WORDS = 20  # AI 标题单词数上限，超长在解析层截断（不影响生成流程）
+DEFAULT_TITLE_COUNT = 2   # 默认标题条数
 
 INCOMPLETE_NOTE = "页面未提供完整简介"
 
@@ -943,6 +945,8 @@ def _llm_parse_pack(text, kw_count, ti_count):
             it = "#" + it.replace(" ", "").replace("#", "")
         kws.append(it)
     titles = clean_list(data.get("titles"), ti_count)
+    # 字数上限：超长标题按单词边界截断（保条数、不中断流程）
+    titles = [" ".join(x.split()[:LLM_TITLE_MAX_WORDS]) for x in titles]
     if not kws or not titles:
         raise RuntimeError("模型返回的 JSON 缺少 keywords/titles 内容")
     return {"keywords": kws, "titles": titles}
@@ -951,7 +955,7 @@ def _llm_parse_pack(text, kw_count, ti_count):
 def llm_generate_pack(title, synopsis, kw_count, ti_count, cfg, timeout=LLM_TIMEOUT):
     """调用用户配置的 LLM，按剧名+简介生成关键词与标题。失败抛 RuntimeError。"""
     kw_count = max(3, min(MAX_KEYWORDS, kw_count))
-    ti_count = max(5, min(MAX_TITLES, ti_count))
+    ti_count = max(1, min(MAX_TITLES, ti_count))  # 默认标题数 2，最低 1（不再钳到 5）
     sys_prompt = (
         "You are a promotion copywriter for Facebook short-drama (vertical drama) ads. "
         "Given a drama title and its official synopsis, produce promotion copy tied to THIS "
@@ -960,7 +964,7 @@ def llm_generate_pack(title, synopsis, kw_count, ti_count, cfg, timeout=LLM_TIME
         "Rules:\n"
         f"- keywords: exactly {kw_count} hashtag keywords in English, each starts with '#', "
         "no spaces inside; mix genre tags, character/relationship phrases, plot hooks, emotion words.\n"
-        f"- titles: exactly {ti_count} English titles, 8-20 words each, varied sentence "
+        f"- titles: exactly {ti_count} English titles, 8-{LLM_TITLE_MAX_WORDS} words each, varied sentence "
         "structures and hooks; every title must reference this story's specifics; no near-duplicates.\n"
         f"- Banned words (never use): {', '.join(LLM_BANNED)}.\n"
         "- The synopsis language sets the copy language (English synopsis → English copy).\n"
@@ -984,7 +988,7 @@ class DramaTab:
         self.title_var = tk.StringVar(value=title)
         self.status_var = tk.StringVar(value="待匹配简介")
         self.keyword_count = 4
-        self.title_count = 10
+        self.title_count = DEFAULT_TITLE_COUNT
         self._llm_busy = False  # AI 生成进行中（防重复点击）
 
         head = ttk.Frame(self.frame)
@@ -1030,8 +1034,8 @@ class DramaTab:
         self.kw_spin.set(4)
         self.kw_spin.pack(side="left")
         ttk.Label(bar, text="标题数:").pack(side="left", padx=(12, 2))
-        self.ti_spin = ttk.Spinbox(bar, from_=5, to=MAX_TITLES, width=3)
-        self.ti_spin.set(10)
+        self.ti_spin = ttk.Spinbox(bar, from_=1, to=MAX_TITLES, width=3)
+        self.ti_spin.set(DEFAULT_TITLE_COUNT)
         self.ti_spin.pack(side="left")
 
     def current_title(self):
@@ -1052,7 +1056,7 @@ class DramaTab:
         try:
             self.title_count = int(self.ti_spin.get())
         except Exception:
-            self.title_count = 10
+            self.title_count = DEFAULT_TITLE_COUNT
         cfg = load_config()
         if cfg.get("llm_api_key"):
             if self._llm_busy:
